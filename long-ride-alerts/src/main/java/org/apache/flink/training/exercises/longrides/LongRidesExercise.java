@@ -18,6 +18,9 @@
 
 package org.apache.flink.training.exercises.longrides;
 
+import org.apache.flink.api.common.state.ValueState;
+import org.apache.flink.api.common.state.ValueStateDescriptor;
+import org.apache.flink.api.common.time.Time;
 import org.apache.flink.configuration.Configuration;
 import org.apache.flink.streaming.api.TimeCharacteristic;
 import org.apache.flink.streaming.api.TimerService;
@@ -27,56 +30,85 @@ import org.apache.flink.streaming.api.functions.KeyedProcessFunction;
 import org.apache.flink.training.exercises.common.datatypes.TaxiRide;
 import org.apache.flink.training.exercises.common.sources.TaxiRideGenerator;
 import org.apache.flink.training.exercises.common.utils.ExerciseBase;
-import org.apache.flink.training.exercises.common.utils.MissingSolutionException;
 import org.apache.flink.util.Collector;
+
+import java.util.concurrent.TimeUnit;
 
 /**
  * The "Long Ride Alerts" exercise of the Flink training in the docs.
  *
  * <p>The goal for this exercise is to emit START events for taxi rides that have not been matched
  * by an END event during the first 2 hours of the ride.
- *
  */
 public class LongRidesExercise extends ExerciseBase {
 
-	/**
-	 * Main method.
-	 *
-	 * @throws Exception which occurs during job execution.
-	 */
-	public static void main(String[] args) throws Exception {
+    /**
+     * Main method.
+     *
+     * @throws Exception which occurs during job execution.
+     */
+    public static void main(String[] args) throws Exception {
 
-		// set up streaming execution environment
-		StreamExecutionEnvironment env = StreamExecutionEnvironment.getExecutionEnvironment();
-		env.setStreamTimeCharacteristic(TimeCharacteristic.EventTime);
-		env.setParallelism(ExerciseBase.parallelism);
+        // set up streaming execution environment
+        StreamExecutionEnvironment env = StreamExecutionEnvironment.getExecutionEnvironment();
+        env.setStreamTimeCharacteristic(TimeCharacteristic.EventTime);
+        env.setParallelism(ExerciseBase.parallelism);
 
-		// start the data generator
-		DataStream<TaxiRide> rides = env.addSource(rideSourceOrTest(new TaxiRideGenerator()));
+        // start the data generator
+        DataStream<TaxiRide> rides = env.addSource(rideSourceOrTest(new TaxiRideGenerator()));
 
-		DataStream<TaxiRide> longRides = rides
-				.keyBy((TaxiRide ride) -> ride.rideId)
-				.process(new MatchFunction());
+        DataStream<TaxiRide> longRides = rides
+                .keyBy((TaxiRide ride) -> ride.rideId)
+                .process(new MatchFunction());
 
-		printOrTest(longRides);
+        printOrTest(longRides);
 
-		env.execute("Long Taxi Rides");
-	}
+        env.execute("Long Taxi Rides");
+    }
 
-	public static class MatchFunction extends KeyedProcessFunction<Long, TaxiRide, TaxiRide> {
+    public static class MatchFunction extends KeyedProcessFunction<Long, TaxiRide, TaxiRide> {
+        private transient ValueState<TaxiRide> rideState;
 
-		@Override
-		public void open(Configuration config) throws Exception {
-			throw new MissingSolutionException();
-		}
+        @Override
+        public void open(Configuration config) throws Exception {
+            rideState = getRuntimeContext().getState(new ValueStateDescriptor<>("rideState", TaxiRide.class));
+        }
 
-		@Override
-		public void processElement(TaxiRide ride, Context context, Collector<TaxiRide> out) throws Exception {
-			TimerService timerService = context.timerService();
-		}
+        @Override
+        public void processElement(TaxiRide ride, Context context, Collector<TaxiRide> out) throws Exception {
+            final TimerService timerService = context.timerService();
+            final TaxiRide existingRide = rideState.value();
+            if (existingRide == null) {
+                rideState.update(ride);
+                if (ride.isStart) {
+                    timerService.registerEventTimeTimer(getTimerTime(ride));
+                }
+            } else {
+                final long rideDurationInHours =
+                        TimeUnit.HOURS.convert(
+                                Math.abs(existingRide.getEventTime() - ride.getEventTime()),
+                                TimeUnit.MILLISECONDS);
+                if (rideDurationInHours > 2 && ride.isStart) {
+                    // Don't bother firing a timer here. Just collect the long ride
+                    out.collect(ride);
+                } else {
+                    if (existingRide.isStart) {
+                        // A timer was fired earlier. We're deleting it here
+                        timerService.deleteEventTimeTimer(getTimerTime(existingRide));
+                    }
+                }
+                rideState.clear();
+            }
+        }
 
-		@Override
-		public void onTimer(long timestamp, OnTimerContext context, Collector<TaxiRide> out) throws Exception {
-		}
-	}
+        private static long getTimerTime(TaxiRide ride) {
+            return ride.getEventTime() + Time.hours(2).toMilliseconds();
+        }
+
+        @Override
+        public void onTimer(long timestamp, OnTimerContext context, Collector<TaxiRide> out) throws Exception {
+            out.collect(rideState.value());
+            rideState.clear();
+        }
+    }
 }

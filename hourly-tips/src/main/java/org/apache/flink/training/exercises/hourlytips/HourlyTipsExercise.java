@@ -18,44 +18,96 @@
 
 package org.apache.flink.training.exercises.hourlytips;
 
+import org.apache.flink.api.common.functions.AggregateFunction;
+import org.apache.flink.api.common.functions.ReduceFunction;
+import org.apache.flink.api.java.tuple.Tuple3;
 import org.apache.flink.streaming.api.TimeCharacteristic;
 import org.apache.flink.streaming.api.datastream.DataStream;
+import org.apache.flink.streaming.api.datastream.SingleOutputStreamOperator;
 import org.apache.flink.streaming.api.environment.StreamExecutionEnvironment;
+import org.apache.flink.streaming.api.functions.windowing.ProcessWindowFunction;
+import org.apache.flink.streaming.api.windowing.assigners.TumblingEventTimeWindows;
+import org.apache.flink.streaming.api.windowing.time.Time;
+import org.apache.flink.streaming.api.windowing.windows.TimeWindow;
 import org.apache.flink.training.exercises.common.datatypes.TaxiFare;
 import org.apache.flink.training.exercises.common.sources.TaxiFareGenerator;
 import org.apache.flink.training.exercises.common.utils.ExerciseBase;
-import org.apache.flink.training.exercises.common.utils.MissingSolutionException;
+import org.apache.flink.util.Collector;
 
 /**
  * The "Hourly Tips" exercise of the Flink training in the docs.
  *
  * <p>The task of the exercise is to first calculate the total tips collected by each driver, hour by hour, and
  * then from that stream, find the highest tip total in each hour.
- *
  */
 public class HourlyTipsExercise extends ExerciseBase {
 
-	/**
-	 * Main method.
-	 *
-	 * @throws Exception which occurs during job execution.
-	 */
-	public static void main(String[] args) throws Exception {
+    /**
+     * Main method.
+     *
+     * @throws Exception which occurs during job execution.
+     */
+    public static void main(String[] args) throws Exception {
 
-		// set up streaming execution environment
-		StreamExecutionEnvironment env = StreamExecutionEnvironment.getExecutionEnvironment();
-		env.setStreamTimeCharacteristic(TimeCharacteristic.EventTime);
-		env.setParallelism(ExerciseBase.parallelism);
+        // set up streaming execution environment
+        StreamExecutionEnvironment env = StreamExecutionEnvironment.getExecutionEnvironment();
+        env.setStreamTimeCharacteristic(TimeCharacteristic.EventTime);
+        env.setParallelism(ExerciseBase.parallelism);
 
-		// start the data generator
-		DataStream<TaxiFare> fares = env.addSource(fareSourceOrTest(new TaxiFareGenerator()));
+        // start the data generator
+        DataStream<TaxiFare> fares = env.addSource(fareSourceOrTest(new TaxiFareGenerator()));
 
-		throw new MissingSolutionException();
+        final SingleOutputStreamOperator<Tuple3<Long, Long, Float>> hourlyMax =
+                fares.keyBy(fare -> fare.driverId)
+                        .window(TumblingEventTimeWindows.of(Time.hours(1)))
+                        .aggregate(new DriverTipsAggregator(), new DriverHourlyTotalTipsProcessWindowFunction())
+                        .timeWindowAll(Time.hours(1))
+                        .reduce(new DriverMaxTipsReducer());
 
-//		printOrTest(hourlyMax);
+        printOrTest(hourlyMax);
 
-		// execute the transformation pipeline
-//		env.execute("Hourly Tips (java)");
-	}
+        // execute the transformation pipeline
+        env.execute("Hourly Tips (java)");
+    }
 
+    private static class DriverMaxTipsReducer implements ReduceFunction<Tuple3<Long, Long, Float>> {
+        @Override
+        public Tuple3<Long, Long, Float> reduce(Tuple3<Long, Long, Float> value1, Tuple3<Long, Long, Float> value2) {
+            return value1.f2 > value2.f2 ? value1 : value2;
+        }
+    }
+
+    private static class DriverTipsAggregator implements AggregateFunction<TaxiFare, Float, Float> {
+        @Override
+        public Float createAccumulator() {
+            return 0F;
+        }
+
+        @Override
+        public Float add(TaxiFare value, Float accumulator) {
+            return value.tip + accumulator;
+        }
+
+        @Override
+        public Float getResult(Float accumulator) {
+            return accumulator;
+        }
+
+        @Override
+        public Float merge(Float a, Float b) {
+            return a + b;
+        }
+    }
+
+    private static class DriverHourlyTotalTipsProcessWindowFunction extends
+            ProcessWindowFunction<Float, Tuple3<Long, Long, Float>, Long, TimeWindow> {
+        @Override
+        public void process(Long key,
+                            ProcessWindowFunction<Float, Tuple3<Long, Long, Float>, Long, TimeWindow>.Context context,
+                            Iterable<Float> elements,
+                            Collector<Tuple3<Long, Long, Float>> out) {
+            final Float sumOfTips = elements.iterator().next();
+            out.collect(Tuple3.of(context.window().getEnd(), key, sumOfTips));
+        }
+    }
 }
